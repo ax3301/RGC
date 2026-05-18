@@ -1,0 +1,3 @@
+.polygon_cache/
+__pycache__/
+*.pyc
