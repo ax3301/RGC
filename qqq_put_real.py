@@ -1,29 +1,59 @@
-"""QQQ put-selling backtest with REAL historical option prices from Massive API.
+"""QQQ put-selling backtest with REAL historical option prices.
 
 Strategy:
-  Each trading day T-1 at close, sell a put expiring T (1-day to expiry) with
-  strike ≈ 0.98 * close(T-1) (rounded to nearest $1 since QQQ strikes are $1).
+  Each trading day T-1 at close, sell a 1DTE put expiring T with
+  strike ≈ 0.98 * close(T-1) (rounded to nearest available QQQ strike).
   Premium = put's EOD close price on T-1.
   If QQQ close(T) <= strike: assigned, hold 10 trading days, then resume.
 
-Requires env: POLYGON_API_KEY (or hard-coded fallback for this session).
+Connection: reads PROXY_URL and PROXY_KEY from env (preferred) or
+falls back to direct POLYGON_API_KEY. Nothing sensitive is hard-coded.
 """
-import os, math, json, time
-from urllib.parse import urlencode
+import os, json, time
 from urllib.request import urlopen, Request
+from urllib.error import HTTPError
 from datetime import date, timedelta
 import yfinance as yf
 import pandas as pd
-import numpy as np
 
-API = os.environ.get("POLYGON_API_KEY", "MhDRBDpwT6rNOWzyMN0uuiYBewlgYfhp")
-BASE = "https://api.massive.com"
-END = date(2026, 5, 18)
+PROXY_URL = os.environ.get("PROXY_URL")
+PROXY_KEY = os.environ.get("PROXY_KEY")
+POLY_KEY  = os.environ.get("POLYGON_API_KEY")
+
+if PROXY_URL and PROXY_KEY:
+    BASE = PROXY_URL.rstrip("/")
+    HEADERS = {"X-Proxy-Key": PROXY_KEY}
+    AUTH_QS = ""
+    print(f"Using proxy: {BASE}")
+elif POLY_KEY:
+    BASE = "https://api.massive.com"
+    HEADERS = {}
+    AUTH_QS = f"&apiKey={POLY_KEY}"
+    print(f"Using direct Polygon/Massive API")
+else:
+    raise SystemExit("Set PROXY_URL+PROXY_KEY or POLYGON_API_KEY env vars")
+
+END   = date(2026, 5, 18)
 START = END - timedelta(days=400)
 HOLD_DAYS = 10
 STRIKE_PCT = 0.98
 
-# ---------- pull QQQ EOD ----------
+def http_get(url: str, retries: int = 3) -> dict | None:
+    for i in range(retries):
+        try:
+            req = Request(url, headers=HEADERS)
+            with urlopen(req, timeout=30) as r:
+                return json.load(r)
+        except HTTPError as e:
+            if e.code == 429:
+                time.sleep(15 * (i + 1))
+                continue
+            return None
+        except Exception:
+            time.sleep(2)
+    return None
+
+# ---------- QQQ EOD via yfinance ----------
 qqq = yf.download("QQQ", start=START.isoformat(), end=END.isoformat(),
                   auto_adjust=False, progress=False)
 if isinstance(qqq.columns, pd.MultiIndex):
@@ -35,61 +65,85 @@ one_year_ago = END - timedelta(days=365)
 qqq = qqq[qqq.index.date >= one_year_ago]
 print(f"QQQ window: {qqq.index[0].date()} → {qqq.index[-1].date()}  ({len(qqq)} days)")
 
-# ---------- option ticker helper ----------
-def occ_put_ticker(expiry: date, strike_dollars: float) -> str:
-    s = f"{int(round(strike_dollars * 1000)):08d}"
-    return f"O:QQQ{expiry.strftime('%y%m%d')}P{s}"
+# ---------- list available QQQ put expiries (with expired=true) ----------
+# We pre-fetch every put contract for each expiration date we care about,
+# so we can pick the strike that's actually listed rather than guessing.
+trading_dates = [ts.date() for ts in qqq.index]
+expiries = set(trading_dates)  # we use 1DTE: sell at T-1, expires T
 
-def fetch_eod(ticker: str, sell_date: date) -> float | None:
-    """Get close price of the option contract on `sell_date`."""
+def fetch_contracts(expiration: date) -> list[dict]:
+    out = []
+    url = (f"{BASE}/v3/reference/options/contracts"
+           f"?underlying_ticker=QQQ&contract_type=put"
+           f"&expiration_date={expiration.isoformat()}"
+           f"&expired=true&limit=1000{AUTH_QS}")
+    while url:
+        d = http_get(url)
+        if not d: break
+        out.extend(d.get("results", []))
+        nxt = d.get("next_url")
+        url = (nxt + AUTH_QS) if nxt else None
+    return out
+
+print("\nFetching contract lists per expiry...")
+contracts_by_exp = {}
+for i, exp in enumerate(sorted(expiries)):
+    contracts_by_exp[exp] = fetch_contracts(exp)
+    if (i + 1) % 25 == 0:
+        print(f"  {i+1}/{len(expiries)}  exp={exp}  n_puts={len(contracts_by_exp[exp])}")
+
+n_with = sum(1 for v in contracts_by_exp.values() if v)
+print(f"Expiries with put contracts: {n_with}/{len(contracts_by_exp)}")
+
+# ---------- pick nearest-strike put per sell-day ----------
+def nearest_put(exp: date, target_strike: float):
+    pool = contracts_by_exp.get(exp, [])
+    if not pool: return None
+    best = min(pool, key=lambda r: abs(float(r["strike_price"]) - target_strike))
+    return best
+
+def fetch_close(ticker: str, sell_date: date) -> float | None:
     url = (f"{BASE}/v2/aggs/ticker/{ticker}/range/1/day/"
-           f"{sell_date.isoformat()}/{sell_date.isoformat()}?apiKey={API}")
-    try:
-        with urlopen(Request(url), timeout=20) as r:
-            data = json.load(r)
-    except Exception as e:
+           f"{sell_date.isoformat()}/{sell_date.isoformat()}?{AUTH_QS.lstrip('&')}")
+    d = http_get(url)
+    if not d or d.get("resultsCount", 0) == 0:
         return None
-    if data.get("resultsCount", 0) == 0:
-        return None
-    return float(data["results"][0]["c"])
+    return float(d["results"][0]["c"])
 
-# ---------- map trade-date → next-trade-date for 1DTE expiry ----------
-dates = list(qqq.index.date)
-next_dt = {dates[i]: dates[i + 1] for i in range(len(dates) - 1)}
+# Map sell-day -> next-trading-day (= expiry we use)
+next_dt = {trading_dates[i]: trading_dates[i + 1]
+           for i in range(len(trading_dates) - 1)}
 
-# ---------- pull premiums ----------
 records = []
-miss = 0
-for i, (ts, row) in enumerate(qqq.iterrows()):
-    sell_d = ts.date()
+print("\nFetching put EOD prices per sell-day...")
+for i, sell_d in enumerate(trading_dates):
     exp = next_dt.get(sell_d)
-    if exp is None:
+    if exp is None: continue
+    prev_close = float(qqq.loc[qqq.index.date == sell_d, "Close"].iloc[0])
+    target = STRIKE_PCT * prev_close
+    contract = nearest_put(exp, target)
+    if contract is None:
+        records.append({"sell_date": sell_d, "expiry": exp,
+                        "prev_close": prev_close, "strike": None,
+                        "premium": None, "moneyness": None})
         continue
-    strike = round(STRIKE_PCT * float(row["Close"]))   # nearest $1
-    # try the round-dollar strike; if missing, try +/-1
-    premium = None
-    used_strike = None
-    for adj in (0, -1, 1, -2, 2):
-        k = strike + adj
-        tk = occ_put_ticker(exp, k)
-        p = fetch_eod(tk, sell_d)
-        if p is not None:
-            premium = p
-            used_strike = k
-            break
-    if premium is None:
-        miss += 1
+    strike = float(contract["strike_price"])
+    ticker = contract["ticker"]
+    premium = fetch_close(ticker, sell_d)
     records.append({"sell_date": sell_d, "expiry": exp,
-                    "prev_close": float(row["Close"]),
-                    "strike": used_strike, "premium": premium})
+                    "prev_close": prev_close, "strike": strike,
+                    "ticker": ticker, "premium": premium,
+                    "moneyness": strike / prev_close - 1})
+    if (i + 1) % 25 == 0:
+        print(f"  {i+1}/{len(trading_dates)}  sell={sell_d}  "
+              f"K={strike}  prem={premium}")
 
-print(f"Premium lookups: {len(records)}   missing: {miss}")
 prem_df = pd.DataFrame(records).set_index("sell_date")
 prem_df.to_csv("/tmp/qqq_put_premiums.csv")
+n_ok = prem_df["premium"].notna().sum()
+print(f"\nPremium lookups: {len(prem_df)}   succeeded: {n_ok}")
 
 # ---------- simulate ----------
-# Walk forward: each day, we are either selling (using premium captured T-1)
-# or holding QQQ from a prior assignment.
 hold_remaining = 0
 last_close = None
 pnl = 0.0
@@ -109,16 +163,14 @@ for ts in qqq.index:
         days_hold += 1
         hold_remaining -= 1
         continue
-    # Selling: premium was set on the prior trading day (sell_date = prev_idx)
     if prev_idx is None:
-        prev_idx = d
-        continue
-    rec = prem_df.loc[prev_idx] if prev_idx in prem_df.index else None
-    if rec is None or pd.isna(rec.get("premium")) or rec.get("strike") is None:
-        prev_idx = d
-        continue
-    strike = float(rec["strike"])
-    premium = float(rec["premium"])
+        prev_idx = d; continue
+    if prev_idx not in prem_df.index:
+        prev_idx = d; continue
+    rec = prem_df.loc[prev_idx]
+    if pd.isna(rec.get("premium")) or rec.get("strike") is None:
+        prev_idx = d; continue
+    strike = float(rec["strike"]); premium = float(rec["premium"])
     notional_sum += strike
     days_put += 1
     if close <= strike:
@@ -137,30 +189,27 @@ avg_K = notional_sum / max(days_put, 1)
 ret_pct = pnl / avg_K * 100
 bh = (qqq["Close"].iloc[-1] / qqq["Close"].iloc[0] - 1) * 100
 
-print(f"\n=== RESULTS (real Massive option prices) ===")
+print(f"\n=== RESULTS (real option prices) ===")
 print(f"Days selling puts: {days_put}")
 print(f"Days holding QQQ:  {days_hold}")
 print(f"Assignments:       {breaches}")
 print(f"Total P&L / share: ${pnl:.2f}")
-print(f"Avg strike (cash-secured base): ${avg_K:.2f}")
-print(f"Return on cash-secured base:    {ret_pct:+.2f}%")
-print(f"\nBuy-and-hold QQQ same window:   {bh:+.2f}% "
-      f"({qqq['Close'].iloc[0]:.2f} → {qqq['Close'].iloc[-1]:.2f})")
+print(f"Avg strike:        ${avg_K:.2f}")
+print(f"Return:            {ret_pct:+.2f}%")
+print(f"Buy-and-hold QQQ:  {bh:+.2f}%")
 
-# Save detailed log
-log = pd.DataFrame(log_rows, columns=["date", "action", "strike",
-                                       "premium", "close", "day_pnl", "cum_pnl"])
+log = pd.DataFrame(log_rows, columns=["date","action","strike",
+                                       "premium","close","day_pnl","cum_pnl"])
 log.to_csv("/tmp/qqq_put_log.csv", index=False)
 
-# Show assignment days
 print("\n--- Assignment days ---")
 print(log[log["action"] == "ASSIGN"].to_string(index=False))
 
-# Premium stats
-prem_clean = prem_df.dropna(subset=["premium"])
-print(f"\n--- Premium stats ({len(prem_clean)} sell days) ---")
-print(f"Mean premium:   ${prem_clean['premium'].mean():.3f} "
-      f"({prem_clean['premium'].mean() / prem_clean['prev_close'].mean() * 100:.3f}% of spot)")
-print(f"Median premium: ${prem_clean['premium'].median():.3f}")
-print(f"Max premium:    ${prem_clean['premium'].max():.3f}")
-print(f"Min premium:    ${prem_clean['premium'].min():.3f}")
+clean = prem_df.dropna(subset=["premium"])
+print(f"\n--- Premium stats ({len(clean)} sell days) ---")
+print(f"Mean:   ${clean['premium'].mean():.3f} "
+      f"({clean['premium'].mean() / clean['prev_close'].mean() * 100:.3f}% of spot)")
+print(f"Median: ${clean['premium'].median():.3f}")
+print(f"Max:    ${clean['premium'].max():.3f}")
+print(f"Min:    ${clean['premium'].min():.3f}")
+print(f"Mean moneyness (K/S - 1): {clean['moneyness'].mean()*100:.2f}%")
