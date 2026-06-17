@@ -1,0 +1,11 @@
+# Research workflow dependencies
+# pip install -r requirements.txt
+yfinance>=0.2.40
+edgartools>=2.0
+sec-edgar-downloader>=5.0
+vectorbt>=0.26
+quantstats>=0.0.62
+pandas>=2.0
+numpy>=1.24
+matplotlib>=3.7
+requests>=2.31

@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+
+# Research output (regeneratable, large)
+reports/
+sec-edgar-filings/
