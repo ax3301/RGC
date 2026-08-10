@@ -57,6 +57,13 @@ def fetch_yahoo(symbol):
 
 
 def main():
+    # Optional signal-window start date (YYYY-MM-DD). Forward returns are always
+    # computed on the full price history; only signals/benchmark are windowed.
+    start = None
+    for a in sys.argv[1:]:
+        if a.startswith("--start="):
+            start = pd.Timestamp(a.split("=", 1)[1])
+
     print("Fetching data from Yahoo Finance ...", file=sys.stderr)
     vix = fetch_yahoo("%5EVIX")   # ^VIX
     qqq = fetch_yahoo("QQQ")
@@ -74,9 +81,16 @@ def main():
     for h in HORIZONS:
         df[f"fwd_{h}"] = df["qqq_close"].shift(-h) / df["qqq_close"] - 1.0
 
+    # Full price history is kept for forward-return lookups above; the analysis
+    # window (signals + benchmark) can be restricted to a start date.
+    full = df
+    if start is not None:
+        df = df[df.index >= start]
+
     n_days = len(df)
     span = f"{df.index[0].date()} to {df.index[-1].date()}"
-    print(f"Aligned trading days: {n_days}  ({span})\n")
+    window_note = f"  [signal window >= {start.date()}]" if start is not None else ""
+    print(f"Aligned trading days: {n_days}  ({span}){window_note}\n")
 
     # ---- Buy & Hold benchmark (every trading day) ----
     bh = {}
